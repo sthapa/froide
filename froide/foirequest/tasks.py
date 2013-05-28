@@ -1,11 +1,15 @@
+import os
+
 from celery.task import task
 
 from django.conf import settings
 from django.utils import translation
 from django.db import transaction
+from django.core.files import File
 
-from .models import FoiRequest
+from .models import FoiRequest, FoiAttachment
 from .foi_mail import _process_mail, _fetch_mail
+from .file_utils import convert_to_pdf
 
 
 @task
@@ -62,3 +66,46 @@ def count_same_foirequests(instance_id):
         req.save()
     except FoiRequest.DoesNotExist:
         pass
+
+
+@task
+def convert_attachment(instance_id):
+    try:
+        att = FoiAttachment.objects.get(pk=instance_id)
+    except FoiAttachment.DoesNotExist:
+        return
+
+    result_file = convert_to_pdf(
+        att.file.path,
+        binary_name=settings.FROIDE_CONFIG.get(
+            'doc_conversion_binary'
+        ),
+        construct_call=settings.FROIDE_CONFIG.get(
+            'doc_conversion_call_func'
+        )
+    )
+    if result_file is None:
+        return
+
+    path, filename = os.path.split(result_file)
+
+    if FoiAttachment.objects.filter(
+            belongs_to=att.belongs_to,
+            name=filename).exists():
+        name, extension = filename.rsplit('.', 1)
+        filename = '%s_converted.%s' % (name, extension)
+
+    new_file = File(file(result_file))
+    new_att = FoiAttachment(
+        belongs_to=att.belongs_to,
+        name=filename,
+        size=new_file.size,
+        file=new_file,
+        approved=False,
+        filetype='application/pdf',
+        is_converted=True
+    )
+    new_att.file.save(filename, new_file)
+    new_att.save()
+    att.converted = new_att
+    att.save()
